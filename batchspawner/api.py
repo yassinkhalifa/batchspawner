@@ -3,6 +3,29 @@ import json
 from jupyterhub.apihandlers import APIHandler, default_handlers
 from tornado import web
 
+# Spawner attributes a single-user server may set through this API. Anything else
+# (notably `ip`, which the Hub proxies to) must not be writable with a user token.
+SETTABLE_KEYS = {"port"}
+
+
+def validate_spawner_update(data):
+    """Validate a POSTed spawner update and return the cleaned dict.
+
+    Raises ValueError with a message suitable for a 400 response.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    unknown = set(data) - SETTABLE_KEYS
+    if unknown:
+        raise ValueError(f"cannot set: {', '.join(sorted(unknown))}")
+    cleaned = {}
+    if "port" in data:
+        port = data["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        cleaned["port"] = port
+    return cleaned
+
 
 class BatchSpawnerAPIHandler(APIHandler):
     @web.authenticated
@@ -20,12 +43,15 @@ class BatchSpawnerAPIHandler(APIHandler):
             if s.api_token == token:
                 spawner = s
                 break
-        data = self.get_json_body()
+        if spawner is None:
+            raise web.HTTPError(404, "No spawner found for this token")
+        try:
+            data = validate_spawner_update(self.get_json_body())
+        except ValueError as e:
+            raise web.HTTPError(400, str(e))
         for key, value in data.items():
-            if hasattr(spawner, key):
-                setattr(spawner, key, value)
+            setattr(spawner, key, value)
         self.finish(json.dumps({"message": "BatchSpawner data configured"}))
-        self.set_status(201)
 
 
 default_handlers.append((r"/api/batchspawner", BatchSpawnerAPIHandler))

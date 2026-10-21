@@ -1,6 +1,8 @@
 """Test BatchSpawner and subclasses"""
 
 import asyncio
+import logging
+import os
 import pwd
 import re
 import time
@@ -14,6 +16,7 @@ from jupyterhub.user import User
 from traitlets import Unicode
 
 from .. import BatchSpawnerRegexStates, JobStatus
+from ..batchspawner import BatchCommandError
 
 testhost = "userhost123"
 testjob = "12345"
@@ -89,7 +92,7 @@ def check_ip(spawner, value):
     assert spawner.ip == value
 
 
-async def test_spawner_start_stop_poll(db, event_loop):
+async def test_spawner_start_stop_poll(db):
     spawner = new_spawner(db=db)
 
     status = await asyncio.wait_for(spawner.poll(), timeout=5)
@@ -110,13 +113,13 @@ async def test_spawner_start_stop_poll(db, event_loop):
     assert spawner.get_state() == {}
 
 
-async def test_stress_submit(db, event_loop):
+async def test_stress_submit(db):
     for i in range(200):
         time.sleep(0.01)
-        test_spawner_start_stop_poll(db, event_loop)
+        test_spawner_start_stop_poll(db)
 
 
-async def test_spawner_state_reload(db, event_loop):
+async def test_spawner_state_reload(db):
     spawner = new_spawner(db=db)
     assert spawner.get_state() == {}
 
@@ -135,7 +138,7 @@ async def test_spawner_state_reload(db, event_loop):
     assert spawner.job_id == testjob
 
 
-async def test_submit_failure(db, event_loop):
+async def test_submit_failure(db):
     spawner = new_spawner(db=db)
     assert spawner.get_state() == {}
     spawner.batch_submit_cmd = "cat > /dev/null; true"
@@ -145,7 +148,7 @@ async def test_submit_failure(db, event_loop):
     assert spawner.job_status == ""
 
 
-async def test_submit_pending_fails(db, event_loop):
+async def test_submit_pending_fails(db):
     """Submission works, but the batch query command immediately fails"""
     spawner = new_spawner(db=db)
     assert spawner.get_state() == {}
@@ -158,7 +161,7 @@ async def test_submit_pending_fails(db, event_loop):
     assert spawner.job_status == ""
 
 
-async def test_poll_fails(db, event_loop):
+async def test_poll_fails(db):
     """Submission works, but a later .poll() fails"""
     spawner = new_spawner(db=db)
     assert spawner.get_state() == {}
@@ -172,7 +175,7 @@ async def test_poll_fails(db, event_loop):
     assert spawner.job_status == ""
 
 
-async def test_unknown_status(db, event_loop):
+async def test_unknown_status(db):
     """Polling returns an unknown status"""
     spawner = new_spawner(db=db)
     assert spawner.get_state() == {}
@@ -187,7 +190,7 @@ async def test_unknown_status(db, event_loop):
     assert spawner.job_status != ""
 
 
-async def test_templates(db, event_loop):
+async def test_templates(db):
     """Test templates in the run_command commands"""
     spawner = new_spawner(db=db)
 
@@ -228,7 +231,7 @@ async def test_templates(db, event_loop):
     assert spawner.get_state() == {}
 
 
-async def test_batch_script(db, event_loop):
+async def test_batch_script(db):
     """Test that the batch script substitutes {cmd}"""
 
     class BatchDummyTestScript(BatchDummy):
@@ -244,7 +247,7 @@ async def test_batch_script(db, event_loop):
     # await asyncio.wait_for(spawner.stop(), timeout=5)
 
 
-async def test_exec_prefix(db, event_loop):
+async def test_exec_prefix(db):
     """Test that all run_commands have exec_prefix"""
 
     class BatchDummyTestScript(BatchDummy):
@@ -332,7 +335,7 @@ async def run_spawner_script(
     assert status == 1
 
 
-async def test_torque(db, event_loop):
+async def test_torque(db):
     spawner_kwargs = {
         "req_nprocs": "5",
         "req_memory": "5678",
@@ -376,7 +379,7 @@ async def test_torque(db, event_loop):
     )
 
 
-async def test_moab(db, event_loop):
+async def test_moab(db):
     spawner_kwargs = {
         "req_nprocs": "5",
         "req_memory": "5678",
@@ -417,7 +420,7 @@ async def test_moab(db, event_loop):
     )
 
 
-async def test_pbs(db, event_loop):
+async def test_pbs(db):
     spawner_kwargs = {
         "req_nprocs": "4",
         "req_memory": "10256",
@@ -458,7 +461,7 @@ async def test_pbs(db, event_loop):
     )
 
 
-async def test_slurm(db, event_loop):
+async def test_slurm(db):
     spawner_kwargs = {
         "req_runtime": "3-05:10:10",
         "req_nprocs": "5",
@@ -503,7 +506,8 @@ normal_slurm_script = [
     (re.compile(r"sudo.*squeue"), "RUNNING " + testhost),
     (re.compile(r"sudo.*squeue"), "RUNNING " + testhost),
     (re.compile(r"sudo.*scancel"), "STOP"),
-    (re.compile(r"sudo.*squeue"), ""),
+    (re.compile(r"sudo.*squeue"), ""),  # stop() confirms the job is gone
+    (re.compile(r"sudo.*squeue"), ""),  # the poll() after stop() finds nothing
 ]
 from .. import SlurmSpawner
 
@@ -529,7 +533,7 @@ async def run_typical_slurm_spawner(
     )
 
 
-# async def test_gridengine(db, event_loop):
+# async def test_gridengine(db):
 #    spawner_kwargs = {
 #        'req_options': 'some_option_asdf',
 #        }
@@ -551,7 +555,7 @@ async def run_typical_slurm_spawner(
 #                       spawner_kwargs=spawner_kwargs)
 
 
-async def test_condor(db, event_loop):
+async def test_condor(db):
     spawner_kwargs = {
         "req_nprocs": "5",
         "req_memory": "5678",
@@ -586,7 +590,7 @@ async def test_condor(db, event_loop):
     )
 
 
-async def test_lfs(db, event_loop):
+async def test_lfs(db):
     spawner_kwargs = {
         "req_nprocs": "5",
         "req_memory": "5678",
@@ -625,7 +629,7 @@ async def test_lfs(db, event_loop):
     )
 
 
-async def test_keepvars(db, event_loop):
+async def test_keepvars(db):
     # req_keepvars
     spawner_kwargs = {
         "req_keepvars": "ABCDE",
@@ -654,7 +658,7 @@ async def test_keepvars(db, event_loop):
     )
 
 
-async def test_early_stop(db, event_loop):
+async def test_early_stop(db):
     script = [
         (re.compile(r"sudo.*sbatch"), str(testjob)),
         (re.compile(r"sudo.*squeue"), "PENDING "),  # pending
@@ -668,3 +672,159 @@ async def test_early_stop(db, event_loop):
     ]
     with pytest.raises(RuntimeError, match="job has disappeared"):
         await run_spawner_script(db, SlurmSpawner, script)
+
+
+# --- Robustness: timeouts, cancellation, scheduler outages, cancel handling ---
+
+
+class BatchDummyGone(BatchDummy):
+    """Like BatchDummy, but can tell 'job finished' apart from 'scheduler unreachable'."""
+
+    state_notfound_re = Unicode("Invalid job id")
+
+
+async def test_run_command_times_out(db):
+    spawner = new_spawner(db=db)
+    spawner.command_timeout = 0.5
+    started = time.monotonic()
+    with pytest.raises(BatchCommandError) as excinfo:
+        await spawner.run_command("sleep 30")
+    assert excinfo.value.timed_out
+    assert time.monotonic() - started < 10
+
+
+async def test_run_command_failure_is_runtime_error(db):
+    """BatchCommandError stays catchable as RuntimeError, with stderr as the message."""
+    spawner = new_spawner(db=db)
+    with pytest.raises(RuntimeError) as excinfo:
+        await spawner.run_command("echo oops >&2; exit 3")
+    assert excinfo.value.args[0] == "oops"
+    assert excinfo.value.returncode == 3
+
+
+async def test_run_command_propagates_cancellation(db):
+    """Cancelling (e.g. the Hub's start timeout) must raise CancelledError, not RuntimeError."""
+    spawner = new_spawner(db=db)
+    task = asyncio.ensure_future(spawner.run_command("sleep 30"))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_query_timeout_is_tolerated_then_gives_up(db):
+    spawner = new_spawner(db=db)
+    spawner.query_failure_tolerance = 2
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    good_status = spawner.job_status
+    spawner.command_timeout = 0.3
+    spawner.batch_query_cmd = "sleep 30"
+
+    # Two timeouts are reported as UNKNOWN and keep the server and its last good status
+    for _ in range(2):
+        assert await spawner.poll() is None
+        assert spawner.job_id == testjob
+        assert spawner.job_status == good_status
+    # The third gives up
+    assert await spawner.poll() == 1
+    assert spawner.job_id == ""
+
+
+async def test_query_outage_is_tolerated_when_job_gone_is_detectable(db):
+    spawner = new_spawner(db=db, spawner_class=BatchDummyGone)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_query_cmd = "echo 'Problem talking to database' >&2; exit 1"
+
+    assert await spawner.poll() is None
+    assert spawner.job_id == testjob
+    assert spawner.query_failures == 1
+
+    # Recovery resets the counter
+    spawner.batch_query_cmd = "echo RUN " + testhost
+    assert await spawner.poll() is None
+    assert spawner.query_failures == 0
+
+
+async def test_finished_job_is_not_found_immediately(db):
+    spawner = new_spawner(db=db, spawner_class=BatchDummyGone)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_query_cmd = "echo 'slurm_load_jobs error: Invalid job id specified' >&2; exit 1"
+
+    assert await spawner.poll() == 1
+    assert spawner.job_id == ""
+
+
+async def test_query_failure_without_gone_detection_keeps_old_behaviour(db):
+    """Spawners that do not define state_notfound_re still treat a failed query as not found."""
+    spawner = new_spawner(db=db)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_query_cmd = "echo broken >&2; exit 1"
+
+    assert await spawner.poll() == 1
+    assert spawner.job_id == ""
+
+
+async def test_tolerance_zero_disables_tolerance(db):
+    spawner = new_spawner(db=db, spawner_class=BatchDummyGone)
+    spawner.query_failure_tolerance = 0
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_query_cmd = "echo outage >&2; exit 1"
+
+    assert await spawner.poll() == 1
+
+
+def test_slurm_spawner_recognises_finished_jobs():
+    from .. import SlurmSpawner
+
+    assert SlurmSpawner.state_notfound_re.default_value == "Invalid job id specified"
+
+
+async def test_stop_without_job_id_runs_no_cancel_command(db):
+    """After a failed submit there is nothing to cancel; stop() must not run scancel/qdel."""
+    spawner = new_spawner(db=db)
+    spawner.batch_cancel_cmd = "echo cancel-ran >&2; exit 1"
+    assert spawner.job_id == ""
+    await asyncio.wait_for(spawner.stop(now=True), timeout=5)
+    await asyncio.wait_for(spawner.stop(), timeout=5)
+
+
+async def test_cancel_of_finished_job_is_not_an_error(db):
+    spawner = new_spawner(db=db, spawner_class=BatchDummyGone)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_cancel_cmd = "echo 'Invalid job id specified' >&2; exit 1"
+    spawner.batch_query_cmd = "echo NOPE"
+
+    await asyncio.wait_for(spawner.stop(), timeout=10)
+
+
+async def test_cancel_failure_is_still_raised(db):
+    spawner = new_spawner(db=db, spawner_class=BatchDummyGone)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    spawner.batch_cancel_cmd = "echo 'permission denied' >&2; exit 1"
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(spawner.stop(now=True), timeout=10)
+
+
+async def test_batch_command_env_applies_to_all_commands(db):
+    spawner = new_spawner(db=db)
+    spawner.batch_command_env = {"BS_TEST_VALUE": "pinned"}
+    # query runs with the Hub's environment plus batch_command_env; submit and cancel merge it
+    # into the spawner environment the same way (see _command_env)
+    spawner.batch_query_cmd = "echo RUN $BS_TEST_VALUE"
+
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    check_ip(spawner, "pinned")
+
+
+async def test_secrets_not_logged_when_submitting(db, caplog):
+    spawner = new_spawner(db=db)
+    secret = "s3cr3t-token-value"
+    env = {"PATH": os.environ.get("PATH", ""), "JUPYTERHUB_API_TOKEN": secret}
+    spawner.get_env = lambda: dict(env)
+
+    with caplog.at_level(logging.DEBUG):
+        await asyncio.wait_for(spawner.start(), timeout=30)
+
+    assert secret not in caplog.text
+    assert "JUPYTERHUB_API_TOKEN" in caplog.text  # names are still logged

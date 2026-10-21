@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased (reliability-hardening)
+
+This release requires Python >=3.8 and JupyterHub >=1.5.1.
+
+#### Behaviour changes
+
+- Batch commands now time out (`command_timeout`, default 60s, 0 disables) and the process group is killed, so a hung scheduler no longer blocks a spawner indefinitely.
+- A failed status query no longer makes the Hub forget a running server. Timeouts, and (for `SlurmSpawner`, via the new `state_notfound_re`) any error other than "Invalid job id", are reported as UNKNOWN for up to `query_failure_tolerance` consecutive failures (default 5; 0 restores the old behaviour).
+- `run_command` no longer turns task cancellation into `RuntimeError`; `CancelledError` propagates after the child process is cleaned up.
+- `stop()` does nothing when there is no job id, and cancelling a job that already finished is not an error.
+- The debug log lists the names of the submit environment variables rather than their values (which include the API token).
+- The `/api/batchspawner` handler only accepts a valid `port`, and answers 404 when no spawner matches the token (it silently succeeded before).
+- `batchspawner-singleuser` retries registering its port with a timeout, and exits non-zero if it cannot, so the job ends instead of running unreachable.
+
+#### New features added
+
+- `batch_command_env`: extra environment variables applied to submit, query and cancel alike.
+- `BatchCommandError` (a `RuntimeError` subclass) with `returncode` and `timed_out`.
+
+#### Fixes
+
+- `setup.py` declared dependencies under the misspelled `install_require`, so none were installed; they are now in `install_requires`, plus `requests` and `traitlets`.
+
 ## v1.3
 
 ### v1.3.0 - 2024-03-19

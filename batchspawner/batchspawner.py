@@ -19,6 +19,7 @@ import asyncio
 import os
 import pwd
 import re
+import signal
 import xml.etree.ElementTree as ET
 from enum import Enum
 
@@ -39,6 +40,19 @@ def format_template(template, *args, **kwargs):
     elif "{{" in template or "{%" in template:
         return Template(template).render(*args, **kwargs)
     return template.format(*args, **kwargs)
+
+
+class BatchCommandError(RuntimeError):
+    """A batch system command failed or timed out.
+
+    Subclasses RuntimeError, with the command's stderr (or a timeout message) as
+    args[0], so code that caught the old RuntimeError keeps working.
+    """
+
+    def __init__(self, message, returncode=None, timed_out=False):
+        super().__init__(message)
+        self.returncode = returncode
+        self.timed_out = timed_out
 
 
 class JobStatus(Enum):
@@ -139,6 +153,36 @@ class BatchSpawnerBase(Spawner):
         help="Script to run after single user server ends.",
     ).tag(config=True)
 
+    command_timeout = Float(
+        60,
+        help="Seconds to wait for a batch command (submit, query, cancel) before "
+        "killing it and treating it as failed. 0 disables the timeout. Without a "
+        "timeout, a hung scheduler blocks the spawner indefinitely.",
+    ).tag(config=True)
+
+    query_failure_tolerance = Integer(
+        5,
+        help="Number of consecutive status queries that may fail (timeout, or an error "
+        "that does not say the job is gone) before the job is considered lost. While "
+        "within the tolerance the job is reported as UNKNOWN, so a brief scheduler or "
+        "database outage does not make JupyterHub forget a running server. 0 restores "
+        "the old behaviour of treating any failed query as 'job not found'. Only "
+        "applies to timeouts, and to spawners that define how a finished job looks "
+        "(see state_notfound_re).",
+    ).tag(config=True)
+
+    batch_command_env = Dict(
+        {},
+        help="Extra environment variables for ALL batch commands (submit, query and "
+        "cancel), e.g. {'PATH': '/usr/bin', 'SLURM_CONF': '/etc/slurm/slurm.conf'}. "
+        "By default submit runs with the spawner environment while query and cancel "
+        "inherit JupyterHub's own, which can resolve different binaries; set this to "
+        "make them consistent. Prefer absolute paths in the batch_*_cmd traits when "
+        "exec_prefix uses sudo, since sudo's secure_path can override PATH.",
+    ).tag(config=True)
+
+    query_failures = Integer(0)
+
     req_username = Unicode()
 
     @default("req_username")
@@ -207,56 +251,70 @@ class BatchSpawnerBase(Spawner):
         """The command which is substituted inside of the batch script"""
         return " ".join([self.batchspawner_singleuser_cmd] + self.cmd + self.get_args())
 
+    def _command_env(self, env=None):
+        """Environment for a batch command: `env` (or JupyterHub's own) plus batch_command_env."""
+        if not self.batch_command_env:
+            return env
+        merged = dict(os.environ if env is None else env)
+        merged.update(self.batch_command_env)
+        return merged
+
+    async def _kill_process(self, proc, cmd):
+        """Kill a still-running subprocess and reap it, without raising."""
+        if proc.returncode is None:
+            try:
+                # The command runs in its own session (see run_command), so kill the whole
+                # group: a shell or sudo wrapper would otherwise leave e.g. squeue running.
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            self.log.error(
+                "Could not confirm the process exited after killing it: %s", cmd
+            )
+
     async def run_command(self, cmd, input=None, env=None):
         proc = await asyncio.create_subprocess_shell(
             cmd,
-            env=env,
+            env=self._command_env(env),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
-        inbytes = None
-
-        if input:
-            inbytes = input.encode()
+        inbytes = input.encode() if input else None
+        timeout = self.command_timeout or None
 
         try:
-            out, eout = await proc.communicate(input=inbytes)
-        except:
-            self.log.debug("Exception raised when trying to run command: %s" % cmd)
-            proc.kill()
-            self.log.debug("Running command failed, killed process.")
-            try:
-                out, eout = await asyncio.wait_for(proc.communicate(), timeout=2)
-                out = out.decode().strip()
-                eout = eout.decode().strip()
-                self.log.error("Subprocess returned exitcode %s" % proc.returncode)
-                self.log.error("Stdout:")
-                self.log.error(out)
-                self.log.error("Stderr:")
-                self.log.error(eout)
-                raise RuntimeError(f"{cmd} exit status {proc.returncode}: {eout}")
-            except asyncio.TimeoutError:
-                self.log.error(
-                    "Encountered timeout trying to clean up command, process probably killed already: %s"
-                    % cmd
-                )
-                return ""
-            except:
-                self.log.error(
-                    "Encountered exception trying to clean up command: %s" % cmd
-                )
-                raise
-        else:
-            eout = eout.decode().strip()
-            err = proc.returncode
-            if err != 0:
-                self.log.error("Subprocess returned exitcode %s" % err)
-                self.log.error(eout)
-                raise RuntimeError(eout)
+            out, eout = await asyncio.wait_for(
+                proc.communicate(input=inbytes), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            self.log.error("Command timed out after %ss, killing it: %s", timeout, cmd)
+            await self._kill_process(proc, cmd)
+            raise BatchCommandError(
+                f"command timed out after {timeout}s: {cmd}", timed_out=True
+            )
+        except BaseException:
+            # Includes asyncio.CancelledError (e.g. the Hub's start timeout): clean up
+            # the child, then re-raise the original exception unchanged.
+            self.log.debug("Exception raised when trying to run command: %s", cmd)
+            await self._kill_process(proc, cmd)
+            raise
 
-        out = out.decode().strip()
-        return out
+        eout = eout.decode().strip()
+        err = proc.returncode
+        if err != 0:
+            self.log.error("Subprocess returned exitcode %s", err)
+            self.log.error(eout)
+            raise BatchCommandError(eout, returncode=err)
+
+        return out.decode().strip()
 
     async def _get_batch_script(self, **subvars):
         """Format batch script from vars"""
@@ -281,8 +339,10 @@ class BatchSpawnerBase(Spawner):
         self.log.info("Spawner script options: %s", subvars)
         self.log.info("Spawner submitting command: %s", cmd)
         self.log.debug("Spawner submitting script:\n%s", script)
-        self.log.debug("Spawner submitting environment: %s", self.get_env())
-        out = await self.run_command(cmd, input=script, env=self.get_env())
+        env = self.get_env()
+        # Only names: the environment holds JUPYTERHUB_API_TOKEN and the OAuth secret.
+        self.log.debug("Spawner submitting environment variables: %s", ", ".join(sorted(env)))
+        out = await self.run_command(cmd, input=script, env=env)
         try:
             self.log.info("Job submitted. output: %s", out)
             self.job_id = self.parse_job_id(out)
@@ -312,14 +372,36 @@ class BatchSpawnerBase(Spawner):
             )
         )
         self.log.debug("Spawner querying job: " + cmd)
+        previous_status = self.job_status
+        failure = None
         try:
             self.job_status = await self.run_command(cmd)
-        except RuntimeError as e:
-            # e.args[0] is stderr from the process
-            self.job_status = e.args[0]
-        except Exception:
-            self.log.error("Error querying job " + self.job_id)
-            self.job_status = ""
+            self.query_failures = 0
+        except Exception as e:
+            failure = e
+            # args[0] is stderr (or the timeout message) for BatchCommandError
+            self.job_status = e.args[0] if isinstance(e, RuntimeError) and e.args else ""
+            if not isinstance(e, RuntimeError):
+                self.log.error("Error querying job %s: %s", self.job_id, e)
+
+        if failure is not None and not self.state_isunknown():
+            timed_out = getattr(failure, "timed_out", False)
+            if (
+                not self.state_isgone()
+                and (timed_out or self.state_gone_detectable())
+                and self.query_failures < self.query_failure_tolerance
+            ):
+                # The scheduler failed to answer; that says nothing about the job.
+                self.query_failures += 1
+                self.log.warning(
+                    "Status query for job %s failed (%d of %d tolerated): %s",
+                    self.job_id,
+                    self.query_failures,
+                    self.query_failure_tolerance,
+                    self.job_status,
+                )
+                self.job_status = previous_status
+                return JobStatus.UNKNOWN
 
         if self.state_isrunning():
             return JobStatus.RUNNING
@@ -336,6 +418,9 @@ class BatchSpawnerBase(Spawner):
     ).tag(config=True)
 
     async def cancel_batch_job(self):
+        if not self.job_id:
+            self.log.info("No batch job to cancel")
+            return
         subvars = self.get_req_subvars()
         subvars["job_id"] = self.job_id
         cmd = " ".join(
@@ -345,7 +430,13 @@ class BatchSpawnerBase(Spawner):
             )
         )
         self.log.info("Cancelling job " + self.job_id + ": " + cmd)
-        await self.run_command(cmd)
+        try:
+            await self.run_command(cmd)
+        except RuntimeError as e:
+            if self.state_isgone(e.args[0] if e.args else ""):
+                self.log.info("Job %s had already finished", self.job_id)
+                return
+            raise
 
     def load_state(self, state):
         """load job_id from state"""
@@ -367,6 +458,7 @@ class BatchSpawnerBase(Spawner):
         super().clear_state()
         self.job_id = ""
         self.job_status = ""
+        self.query_failures = 0
 
     def make_preexec_fn(self, name):
         """make preexec fn to change uid (if running as root) before job submission"""
@@ -383,6 +475,19 @@ class BatchSpawnerBase(Spawner):
     def state_isunknown(self):
         "Return boolean indicating if job state retrieval failed because of the resource manager"
         return None
+
+    def state_isgone(self, status=None):
+        """Return boolean indicating the resource manager says the job no longer exists.
+
+        `status` is text to examine, default self.job_status. Subclasses that can
+        recognise a finished job's error message should override this together with
+        state_gone_detectable.
+        """
+        return False
+
+    def state_gone_detectable(self):
+        "Return True if state_isgone can tell 'job finished' apart from 'scheduler unreachable'"
+        return False
 
     def state_gethost(self):
         "Return string, hostname or addr of running job, likely by parsing self.job_status"
@@ -473,6 +578,10 @@ class BatchSpawnerBase(Spawner):
         Returns immediately after sending job cancellation command if now=True, otherwise
         tries to confirm that job is no longer running."""
 
+        if not self.job_id:
+            self.log.info("No batch job to stop")
+            return
+
         self.log.info("Stopping server job " + self.job_id)
         await self.cancel_batch_job()
         if now:
@@ -545,6 +654,23 @@ class BatchSpawnerRegexStates(BatchSpawnerBase):
         help="Regex that matches job_status if the resource manager is not answering."
         "Blank indicates not used.",
     ).tag(config=True)
+
+    state_notfound_re = Unicode(
+        "",
+        help="Regex that matches a failed status query's error output when the "
+        "resource manager reports the job no longer exists (e.g. it already finished). "
+        "Blank means not used. When set, any other failed query is treated as a "
+        "scheduler outage and tolerated (see query_failure_tolerance).",
+    ).tag(config=True)
+
+    def state_isgone(self, status=None):
+        status = self.job_status if status is None else status
+        if self.state_notfound_re:
+            return bool(status and re.search(self.state_notfound_re, status))
+        return False
+
+    def state_gone_detectable(self):
+        return bool(self.state_notfound_re)
 
     def state_ispending(self):
         assert self.state_pending_re, "Misconfigured: define state_running_re"
@@ -739,6 +865,8 @@ echo "jupyterhub-singleuser ended gracefully"
         r"^slurm_load_jobs error: (?:Socket timed out on send/recv|Unable to contact slurm controller)"
     ).tag(config=True)
     state_exechost_re = Unicode(r"\s+((?:[\w_-]+\.?)+)$").tag(config=True)
+    # squeue/scancel on a finished job: "Invalid job id specified"
+    state_notfound_re = Unicode(r"Invalid job id specified").tag(config=True)
 
     def parse_job_id(self, output):
         # make sure jobid is really a number

@@ -33,11 +33,13 @@ setup(
         "About Jupyterhub": "http://jupyterhub.readthedocs.io/en/latest/",
         "Jupyter Project": "http://jupyter.org",
     },
-    python_requires=">=3.6",
-    install_require={
+    python_requires=">=3.8",
+    install_requires=[
         "jinja2",
         "jupyterhub>=1.5.1",
-    },
+        "requests",
+        "traitlets",
+    ],
     extras_require={
         "test": [
             "pytest",
