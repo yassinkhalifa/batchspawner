@@ -858,3 +858,22 @@ async def test_start_does_not_use_deprecated_spawner_db(db):
     spawner = new_spawner(db=db, spawner_class=NoDb)
     await asyncio.wait_for(spawner.start(), timeout=30)
     assert spawner.job_id == testjob
+
+
+def test_slurm_recognises_finished_job_messages(db):
+    """Messages seen from Slurm for a job that no longer exists (squeue -M / scancel -M, Slurm 25.x)."""
+    from .. import SlurmSpawner
+
+    spawner = new_spawner(db=db, spawner_class=SlurmSpawner)
+    for message in (
+        "slurm_load_jobs error: Invalid job id specified",
+        "scancel: error: Kill job error on job id 43316: Invalid job id specified",
+    ):
+        assert spawner.state_isgone(message), message
+    # Scheduler/database outages must NOT count as a finished job
+    for message in (
+        "slurm_load_jobs error: Unable to contact slurm controller",
+        "squeue: error: Problem talking to database",
+        "",
+    ):
+        assert not spawner.state_isgone(message), message
