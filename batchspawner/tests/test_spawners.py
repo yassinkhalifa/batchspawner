@@ -828,3 +828,33 @@ async def test_secrets_not_logged_when_submitting(db, caplog):
 
     assert secret not in caplog.text
     assert "JUPYTERHUB_API_TOKEN" in caplog.text  # names are still logged
+
+
+# --- Compatibility with Slurm 25.05 and current JupyterHub ---
+
+
+def test_slurm_script_get_user_env_takes_no_argument():
+    """Slurm 25.05 rejects '--get-user-env=<mode>' ("option doesn't allow an argument"); the bare
+    flag works on old and new versions."""
+    from .. import SlurmSpawner
+
+    script = SlurmSpawner.batch_script.default_value
+    assert re.search(r"^#SBATCH --get-user-env$", script, re.M)
+    assert "--get-user-env=" not in script
+
+
+async def test_start_does_not_use_deprecated_spawner_db(db):
+    """Spawner.db is deprecated and slated for removal; start() must not touch it."""
+
+    class NoDb(BatchDummy):
+        @property
+        def db(self):
+            raise AssertionError("start() must not use the deprecated Spawner.db")
+
+        @db.setter
+        def db(self, value):
+            pass
+
+    spawner = new_spawner(db=db, spawner_class=NoDb)
+    await asyncio.wait_for(spawner.start(), timeout=30)
+    assert spawner.job_id == testjob

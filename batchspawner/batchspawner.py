@@ -563,7 +563,8 @@ class BatchSpawnerBase(Spawner):
                     " but died before launching the single-user server."
                 )
 
-        self.db.commit()
+        # No self.db.commit() here: Spawner.db is deprecated ("will be removed") and JupyterHub itself
+        # saves get_state() once start() returns.
         self.log.info(
             "Notebook server job {} started at {}:{}".format(
                 self.job_id, self.ip, self.port
@@ -805,7 +806,7 @@ class SlurmSpawner(UserEnvMixin, BatchSpawnerRegexStates):
 #SBATCH --job-name=spawner-jupyterhub
 #SBATCH --chdir={{homedir}}
 #SBATCH --export={{keepvars}}
-#SBATCH --get-user-env=L
+#SBATCH --get-user-env
 {% if partition  %}#SBATCH --partition={{partition}}
 {% endif %}{% if runtime    %}#SBATCH --time={{runtime}}
 {% endif %}{% if memory     %}#SBATCH --mem={{memory}}
